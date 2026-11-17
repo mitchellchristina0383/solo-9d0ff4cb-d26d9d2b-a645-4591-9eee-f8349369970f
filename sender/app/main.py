@@ -22,6 +22,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from app import seal
+
 DB_PATH = os.environ.get("DB_PATH", "/data/sender.db")
 RECEIVER_URL = os.environ.get("RECEIVER_URL", "http://localhost:8001").rstrip("/")
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "3"))
@@ -224,6 +226,7 @@ def _startup_reconcile() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    seal.init_seal_db()  # 独立凭据库：重启后旧封存仍可核验
     if STARTUP_RECONCILE:
         threading.Thread(target=_startup_reconcile, daemon=True).start()
     yield
@@ -320,6 +323,51 @@ def reconcile_notification(nid: int):
 def reconcile_all_endpoint():
     n = reconcile_all_open()
     return {"reconciled": n}
+
+
+# ---------------- 回执封存与复核 ----------------
+
+VALID_SEAL_SIMULATE = {"truncated", "save_fail"}
+
+
+class SealIn(BaseModel):
+    note: str | None = None
+
+
+@app.post("/api/seals")
+def create_seal_endpoint(body: SealIn, simulate: str | None = Query(default=None)):
+    """封存接收端当前回执。失联 / 读取不完整 / 保存失败一律返回错误，绝不显示封存成功。"""
+    if simulate is not None and simulate not in VALID_SEAL_SIMULATE:
+        return JSONResponse(status_code=400,
+                            content={"detail": f"simulate 仅支持：{sorted(VALID_SEAL_SIMULATE)}"})
+    try:
+        out = seal.create_seal(note=body.note, simulate=simulate)
+    except seal.SealError as exc:
+        return JSONResponse(status_code=exc.http_status, content={"detail": str(exc)})
+    return JSONResponse(status_code=201, content=out)
+
+
+@app.get("/api/seals")
+def list_seals_endpoint():
+    return {"items": seal.list_seals()}
+
+
+@app.get("/api/seals/{seal_no}")
+def get_seal_endpoint(seal_no: str):
+    detail = seal.get_seal_detail(seal_no)
+    if detail is None:
+        return JSONResponse(status_code=404, content={"detail": "封存不存在"})
+    return detail
+
+
+@app.post("/api/seals/{seal_no}/verify")
+def verify_seal_endpoint(seal_no: str):
+    """对既有封存重新核验。任何通信/完整性/保存失败都返回错误，绝不显示核验通过。"""
+    try:
+        out = seal.verify_seal(seal_no)
+    except seal.SealError as exc:
+        return JSONResponse(status_code=exc.http_status, content={"detail": str(exc)})
+    return out
 
 
 @app.get("/")

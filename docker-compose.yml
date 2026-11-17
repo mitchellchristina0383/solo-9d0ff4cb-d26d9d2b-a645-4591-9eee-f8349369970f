@@ -19,10 +19,12 @@ services:
       - "8000:8000"
     environment:
       DB_PATH: /data/sender.db
+      SEAL_DB_PATH: /seal-data/seals.db
       RECEIVER_URL: http://receiver:8001
       HTTP_TIMEOUT: "3"
     volumes:
       - sender_data:/data
+      - sender_seal_data:/seal-data
     depends_on:
       - receiver
     restart: unless-stopped
@@ -30,3 +32,4 @@ services:
 volumes:
   receiver_data:
   sender_data:
+  sender_seal_data:

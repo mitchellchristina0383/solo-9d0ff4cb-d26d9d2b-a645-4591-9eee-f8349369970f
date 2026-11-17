@@ -36,6 +36,13 @@
   .muted { color: #9aa5b1; font-size: 12px; }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
   .err-text { color: #c0392b; font-size: 12px; max-width: 220px; word-break: break-all; }
+  .b-OK { background: #d9f2e3; color: #1c7c43; }
+  .b-BAD { background: #fdecea; color: #c0392b; }
+  .b-NONE { background: #e4e7eb; color: #52606d; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  details { margin-top: 8px; }
+  details summary { cursor: pointer; font-size: 12px; color: #0967d2; }
+  pre { background: #f4f6f8; border-radius: 6px; padding: 8px; font-size: 12px; overflow-x: auto; margin: 6px 0; }
 </style>
 </head>
 <body>
@@ -79,6 +86,25 @@
       </thead>
       <tbody id="rows"></tbody>
     </table>
+  </section>
+
+  <section class="card">
+    <div class="toolbar">
+      <h2 style="margin:0;flex:1">回执封存与复核（审计）</h2>
+      <button class="small" id="btn-seal">封存接收端当前回执</button>
+    </div>
+    <p class="muted" style="margin:0 0 10px">
+      封存凭据保存在发送端独立 SQLite 库，仅追加、不覆盖。以封存时的最大回执号为界复核：
+      报告<b>缺失 / 内容改变 / 后来插入的旧号</b>；封存后正常新增的回执不算异常。
+      接收端失联、读取不完整或保存失败时，不会显示封存成功或核验通过。
+    </p>
+    <table>
+      <thead>
+        <tr><th>封存编号</th><th>边界(最大回执号)</th><th>行数</th><th>封存时间 (UTC)</th><th>快照哈希</th><th>最近复核</th><th>操作</th></tr>
+      </thead>
+      <tbody id="seal-rows"></tbody>
+    </table>
+    <div id="seal-msg" style="margin-top:10px;font-size:13px;padding:8px 10px;border-radius:6px;display:none"></div>
   </section>
 </main>
 <script>
@@ -157,6 +183,89 @@ document.getElementById("btn-reconcile-all").onclick = async () => {
 };
 load();
 setInterval(load, 5000);
+
+// ---------------- 封存与复核 ----------------
+function showSealMsg(text, ok) {
+  const el = document.getElementById("seal-msg");
+  el.textContent = text;
+  el.style.display = "block";
+  el.style.background = ok ? "#e3f2e9" : "#fdecea";
+  el.style.color = ok ? "#1c7c43" : "#c0392b";
+}
+
+function verifyBadge(lastPassed, verifyCount) {
+  if (!verifyCount) return '<span class="badge b-NONE">未复核</span>';
+  return lastPassed === 1
+    ? '<span class="badge b-OK">最近：通过</span>'
+    : '<span class="badge b-BAD">最近：发现异常</span>';
+}
+
+function renderVerifyResult(r) {
+  if (r.passed) {
+    showSealMsg("核验通过（封存 " + r.seal_no + "）：边界内旧回执无缺失、无改动、无插入旧号；" +
+      "封存后正常新增 " + r.new_after_seal + " 条（不算异常）。", true);
+    return;
+  }
+  const parts = [];
+  if (r.missing.length) parts.push("缺失回执号：" + r.missing.join(", "));
+  if (r.changed.length) parts.push("内容改变：" + r.changed.map(c => "#" + c.receipt_id).join(", "));
+  if (r.inserted.length) parts.push("后来插入的旧号：" + r.inserted.map(c => "#" + c.receipt_id).join(", "));
+  showSealMsg("核验发现异常（封存 " + r.seal_no + "）：" + parts.join("；") +
+    "。封存后正常新增 " + r.new_after_seal + " 条（不算异常）。明细见对应行。", false);
+}
+
+async function loadSeals() {
+  const { data } = await api("/api/seals");
+  const tbody = document.getElementById("seal-rows");
+  tbody.innerHTML = "";
+  for (const s of (data.items || [])) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="mono">' + esc(s.seal_no) + "</td>" +
+      "<td>" + s.max_id + "</td><td>" + s.row_count + "</td>" +
+      '<td class="muted">' + esc(s.sealed_at) + "</td>" +
+      '<td class="mono muted">' + esc((s.receiver_snapshot_id || "").slice(0, 12)) + "…</td>" +
+      "<td>" + verifyBadge(s.last_passed, s.verify_count) + "</td>" +
+      '<td><button class="small" data-act="verify">重新核验</button> ' +
+      '<button class="small ghost" data-act="detail">凭据/历史</button></td>';
+    tr.querySelector('[data-act="verify"]').onclick = async () => {
+      const r = await api(`/api/seals/${encodeURIComponent(s.seal_no)}/verify`, { method: "POST" });
+      if (r.status >= 400) { showSealMsg("核验未完成（绝不显示通过）：" + (r.data.detail || r.status), false); }
+      else { renderVerifyResult(r.data); }
+      loadSeals();
+    };
+    tr.querySelector('[data-act="detail"]').onclick = async () => {
+      const r = await api(`/api/seals/${encodeURIComponent(s.seal_no)}`);
+      if (r.status === 200) {
+        showSealMsg("封存凭据与复核历史（" + s.seal_no + "）见展开内容", true);
+        const box = document.createElement("details");
+        box.open = true;
+        box.innerHTML = "<summary>封存 " + esc(s.seal_no) + " 的凭据与复核历史（点击折叠）</summary>" +
+          "<pre>" + esc(JSON.stringify(r.data, null, 2)) + "</pre>";
+        tr.after(box);
+      } else {
+        showSealMsg("读取封存凭据失败：" + (r.data.detail || r.status), false);
+      }
+    };
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById("btn-seal").onclick = async () => {
+  const r = await api("/api/seals", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note: "值班网页封存" }),
+  });
+  if (r.status === 201) {
+    showSealMsg("封存成功：编号 " + r.data.seal_no + "，边界最大回执号 " + r.data.max_id +
+      "，共固化 " + r.data.row_count + " 条回执凭据（独立库，不可覆盖）。", true);
+  } else {
+    showSealMsg("封存失败（不显示成功）：" + (r.data.detail || r.status), false);
+  }
+  loadSeals();
+};
+loadSeals();
+setInterval(loadSeals, 5000);
 </script>
 </body>
 </html>

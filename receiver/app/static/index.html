@@ -16,6 +16,13 @@
   th { color: #7b8794; font-weight: 600; }
   code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .muted { color: #9aa5b1; font-size: 12px; }
+  .demo { border: 1px dashed #c0392b; }
+  .demo h2 { color: #c0392b; }
+  .demo input { width: 110px; padding: 6px 8px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 13px; }
+  .demo button { background: #c0392b; color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; margin-right: 6px; }
+  #tamper-msg { margin-top: 8px; font-size: 12px; display: none; padding: 6px 8px; border-radius: 6px; }
+  #tamper-msg.ok { display: block; background: #e3f2e9; color: #1c7c43; }
+  #tamper-msg.err { display: block; background: #fdecea; color: #c0392b; }
 </style>
 </head>
 <body>
@@ -27,12 +34,29 @@
   <section class="card">
     <p class="muted">
       接口：<code>POST /api/receipts</code>（body 可带 <code>"simulate":"lose_response"</code> 模拟入库后丢响应，
-      或 <code>"slow"</code> 模拟慢回执）· <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执
+      或 <code>"slow"</code> 模拟慢回执）· <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执 ·
+      <code>GET /api/snapshot</code> 返回同一只读事务的已提交快照
     </p>
     <table>
       <thead><tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>入账时间 (UTC)</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
+  </section>
+
+  <section class="card demo">
+    <h2>演示用 · 台账篡改台（仅用于演练发送端封存/核验，正常业务不提供）</h2>
+    <p class="muted">
+      删除 = 旧回执被误删；改内容 = 回执字段被改动（不重算哈希，模拟直接改库）；
+      插入旧号 = 以小于当前最大号的旧 id 补入一条记录。操作后到发送端对既有封存执行「重新核验」。
+    </p>
+    <div>
+      <input type="number" id="tid" placeholder="回执 ID" min="1" style="width:110px">
+      <input type="text" id="tval" placeholder="新结果（改内容时）" style="width:180px">
+      <button data-op="delete">删除该回执</button>
+      <button data-op="change">改动内容</button>
+      <button data-op="insert_old">插入旧号</button>
+    </div>
+    <div id="tamper-msg"></div>
   </section>
 </main>
 <script>
@@ -51,6 +75,27 @@ async function load() {
 }
 load();
 setInterval(load, 3000);
+
+function showTamper(text, ok) {
+  const el = document.getElementById("tamper-msg");
+  el.textContent = text;
+  el.className = ok ? "ok" : "err";
+}
+document.querySelectorAll(".demo button[data-op]").forEach(btn => {
+  btn.onclick = async () => {
+    const id = parseInt(document.getElementById("tid").value, 10);
+    if (!id) { showTamper("请先填写回执 ID", false); return; }
+    const body = { op: btn.dataset.op, id: id };
+    const v = document.getElementById("tval").value.trim();
+    if (v) body.new_result = v;
+    const r = await fetch("/api/demo/tamper", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    showTamper(d.detail || ("HTTP " + r.status), r.ok);
+    load();
+  };
+});
 </script>
 </body>
 </html>

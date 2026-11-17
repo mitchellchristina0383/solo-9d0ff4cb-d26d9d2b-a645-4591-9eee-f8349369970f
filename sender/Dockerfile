@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 ENV DB_PATH=/data/sender.db \
+    SEAL_DB_PATH=/seal-data/seals.db \
     RECEIVER_URL=http://receiver:8001 \
     HTTP_TIMEOUT=3
 

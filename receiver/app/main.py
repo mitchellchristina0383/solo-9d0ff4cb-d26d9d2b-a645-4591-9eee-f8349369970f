@@ -15,13 +15,15 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("DB_PATH", "/data/receiver.db")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 VALID_SIMULATE = {"lose_response", "slow"}
+VALID_SNAPSHOT_SIMULATE = {"truncated"}
+VALID_TAMPER_OPS = {"delete", "change", "insert_old"}
 
 
 def now_iso() -> str:
@@ -165,6 +167,118 @@ def list_or_get_receipts(env: str | None = None, release_no: str | None = None):
             return row_to_dict(row)
         rows = conn.execute("SELECT * FROM receipts ORDER BY id DESC").fetchall()
         return {"items": [row_to_dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/snapshot")
+def get_snapshot(simulate: str | None = Query(default=None)):
+    """返回接收端台账的一个已提交快照（同一只读事务内读取，保证与入账交错时不漏行、不混入部分新记录）。
+
+    响应含：
+    - snapshot_id：全部行按 id 排序的规范化 JSON 的 SHA-256，供发送端校验读取完整性；
+    - max_id / count / rows：封存与复核的比对依据；
+    - taken_at：快照时间（UTC）。
+    演示故障注入 simulate=truncated：故意只返回部分行，制造「读取不完整」场景。
+    """
+    if simulate is not None and simulate not in VALID_SNAPSHOT_SIMULATE:
+        return JSONResponse(status_code=400,
+                            content={"detail": f"simulate 仅支持：{sorted(VALID_SNAPSHOT_SIMULATE)}"})
+    conn = connect()
+    try:
+        # 单一只读事务：SQLite 的事务快照保证期间任何并发入账要么整行可见、要么整行不可见
+        conn.execute("BEGIN")
+        try:
+            rows = conn.execute("SELECT * FROM receipts ORDER BY id ASC").fetchall()
+            items = [row_to_dict(r) for r in rows]
+            max_id = items[-1]["id"] if items else 0
+            canonical = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            snapshot_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            out = {
+                "snapshot_id": snapshot_id,
+                "max_id": max_id,
+                "count": len(items),
+                "taken_at": now_iso(),
+                "rows": items,
+            }
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        if simulate == "truncated":
+            cut = max(0, len(items) // 2)
+            out["rows"] = items[:cut]
+            out["simulated_truncation"] = True
+        return out
+    except sqlite3.Error as exc:
+        return JSONResponse(status_code=500, content={"detail": f"快照读取失败：{exc}"})
+    finally:
+        conn.close()
+
+
+class TamperIn(BaseModel):
+    """演示用：模拟对已入账回执的人工/意外篡改（正常业务接口绝不提供这些操作）。"""
+    op: str
+    id: int
+    new_result: str | None = None
+
+
+@app.post("/api/demo/tamper")
+def demo_tamper(body: TamperIn):
+    if body.op not in VALID_TAMPER_OPS:
+        return JSONResponse(status_code=400,
+                            content={"detail": f"op 仅支持：{sorted(VALID_TAMPER_OPS)}"})
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT * FROM receipts WHERE id=?", (body.id,)).fetchone()
+            if body.op in ("delete", "change") and row is None:
+                conn.execute("COMMIT")
+                return JSONResponse(status_code=404, content={"detail": f"回执 #{body.id} 不存在"})
+
+            if body.op == "delete":
+                conn.execute("DELETE FROM receipts WHERE id=?", (body.id,))
+                detail = f"已删除回执 #{body.id}"
+
+            elif body.op == "change":
+                new_result = (body.new_result or "").strip() or "tampered"
+                # 直接改字段：刻意不重算 content_hash，模拟台账原始数据被改动
+                conn.execute("UPDATE receipts SET result=? WHERE id=?", (new_result, body.id))
+                detail = f"回执 #{body.id} 结果已改为 {new_result}"
+
+            else:  # insert_old：用显式旧号插入（AUTOINCREMENT 允许补未占用的 id）
+                if row is not None:
+                    conn.execute("COMMIT")
+                    return JSONResponse(status_code=409, content={"detail": f"回执号 {body.id} 已存在"})
+                max_row = conn.execute("SELECT MAX(id) AS m FROM receipts").fetchone()
+                if max_row["m"] is not None and body.id > max_row["m"]:
+                    conn.execute("COMMIT")
+                    return JSONResponse(status_code=400,
+                                        content={"detail": "insert_old 只能插入小于当前最大号的旧号"})
+                now = now_iso()
+                result = (body.new_result or "").strip() or "late_inserted"
+                conn.execute(
+                    """INSERT INTO receipts (id, env, release_no, result, content_hash, received_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (body.id, f"demo_tamper_{body.id}", f"TAMPER-{body.id}", result,
+                     "demo-tampered-row", now),
+                )
+                detail = f"已以后来插入方式补入旧回执号 {body.id}"
+
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return {"ok": True, "detail": detail}
+    except sqlite3.Error as exc:
+        return JSONResponse(status_code=500, content={"detail": f"演示篡改操作失败：{exc}"})
     finally:
         conn.close()
 

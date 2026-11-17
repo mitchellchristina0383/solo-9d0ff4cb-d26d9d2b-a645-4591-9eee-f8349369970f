@@ -20,7 +20,8 @@ start_receiver() {
     >>"$LOG_DIR/receiver.log" 2>&1 &
 }
 start_sender() {
-  DB_PATH="$DATA_DIR/sender.db" RECEIVER_URL="http://127.0.0.1:8001" \
+  DB_PATH="$DATA_DIR/sender.db" SEAL_DB_PATH="$DATA_DIR/seals.db" \
+  RECEIVER_URL="http://127.0.0.1:8001" \
     nohup "$PY" -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --app-dir "$ROOT/sender" \
     >>"$LOG_DIR/sender.log" 2>&1 &
 }
@@ -44,5 +45,15 @@ case "${1:-}" in
     RN_HOOK_RESTART_SENDER="$ROOT/tests/run_local.sh restart-sender" \
     python3 "$ROOT/tests/selftest.py" --lifecycle
     ;;
-  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-sender|clean|test}"; exit 1 ;;
+  audit-test)
+    "$0" stop-all || true
+    rm -rf "$DATA_DIR"; mkdir -p "$DATA_DIR"
+    start_receiver; start_sender
+    RN_LIFECYCLE=1 \
+    RN_HOOK_STOP_RECEIVER="$ROOT/tests/run_local.sh stop-receiver" \
+    RN_HOOK_START_RECEIVER="$ROOT/tests/run_local.sh start-receiver" \
+    RN_HOOK_RESTART_SENDER="$ROOT/tests/run_local.sh restart-sender" \
+    python3 "$ROOT/tests/audit_selftest.py" --lifecycle
+    ;;
+  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-sender|clean|test|audit-test}"; exit 1 ;;
 esac
